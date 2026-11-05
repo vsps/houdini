@@ -1,0 +1,523 @@
+// ps_windows.osl
+// ---------------------------------------------------------------------------
+// Parallax "interior mapping" shader for Redshift (Houdini / Solaris).
+// Fakes an office interior behind a flat facade from separate wall textures
+// (unlike jii_window_parallax_adv2.osl, which uses a UV/dPdu frame and a
+// single atlas texture).
+//
+// Frame: built from the face normal in world space (or object space via the
+// "Object space" toggle, so rooms stick to transformed/instanced geo):
+//   up = Y axis, T = right along the face, B = up in the face plane, Z = -N
+// The room is a box (roomWidth x roomHeight x roomDepth) in world units,
+// tiled across the face by repeatU/repeatV. Per pixel the actual view ray is
+// traced from the true front-plane hit point into the box and intersected
+// with the enabled walls, so the parallax is perspective-correct for both
+// perspective and orthographic cameras. Compositing order: hit wall ->
+// midground sprite card -> curtains/blinds -> front window mask.
+//
+// Per-room controls: colour variation from a 1D ramp texture, lit/unlit
+// state (random ratio and/or clustered perlin field), sprite presence chance
+// plus random (or indexed) selection of a spritesheet tile, and random
+// curtain/blind openness (min/max + frequency + random closed ratio).
+// Unlit rooms skip all interior texture lookups.
+//
+// Notes:
+//  - I convention differs between renderers; the shader flips I so it always
+//    points into the room. Backfaces therefore get mirrored parallax
+//    (acceptable: facades are meant to be viewed front-on).
+//  - The frame uses the shading normal N, so bump/curved normals make rooms
+//    swim; intended for flat facades.
+// ---------------------------------------------------------------------------
+
+color ps_tex_color(string name, float u, float v)
+{
+    // Walls are opaque; a missing texture falls back to a neutral grey so the
+    // shader is still testable before all maps are assigned.
+    if (name == "")
+        return color(0.35);
+    return texture(name, u, v);
+}
+
+color ps_tex_color_alpha(string name, float u, float v, output float a)
+{
+    a = 0.0;
+    if (name == "")
+        return color(0.0);
+    return texture(name, u, v, "alpha", a);
+}
+
+float ps_v(float v, int flip)
+{
+    // OSL texture origin is bottom-left; allow flipping V if needed.
+    return flip ? (1.0 - v) : v;
+}
+
+
+float ps_hash(point p)
+{
+    // Typed wrapper: noise() is overloaded on return type, so calling it
+    // with a point inside an expression is ambiguous in oslc. Assigning to
+    // a float here pins the float version.
+    float h = noise("hash", p);
+    return h;
+}
+
+shader ps_windows
+[[ string label = "PS Windows",
+   string help  = "World-space interior mapping for fake office rooms. "
+                  "Provide wall/window/sprite textures; room boxes tile "
+                  "across the face using world Y and the face normal." ]]
+(
+    // ===== Options =========================================================
+    int   enableLeft    = 1   [[ string widget = "checkBox", string page = "Options", string label = "Left wall" ]],
+    int   enableRight   = 1   [[ string widget = "checkBox", string page = "Options", string label = "Right wall" ]],
+    int   enableBack    = 1   [[ string widget = "checkBox", string page = "Options", string label = "Back wall" ]],
+    int   enableCeiling = 1   [[ string widget = "checkBox", string page = "Options", string label = "Ceiling" ]],
+    int   enableFloor   = 1   [[ string widget = "checkBox", string page = "Options", string label = "Floor" ]],
+    int   enableWindow  = 1   [[ string widget = "checkBox", string page = "Options", string label = "Window mask" ]],
+    int   enableSprite  = 1   [[ string widget = "checkBox", string page = "Options", string label = "Sprite" ]],
+    int   enableCurtains = 1  [[ string widget = "checkBox", string page = "Options", string label = "Curtains" ]],
+    int   flipV         = 0   [[ string widget = "checkBox", string page = "Options", string label = "Flip texture V" ]],
+    int   useObjectSpace = 0  [[ string widget = "checkBox", string page = "Options", string label = "Object space", string help = "Build the room frame in object space so rooms follow transformed/animated/instanced geometry" ]],
+
+    // ===== Textures ========================================================
+    string leftTex   = ""   [[ string widget = "filename", string page = "Textures", string label = "Left wall" ]],
+    string rightTex  = ""   [[ string widget = "filename", string page = "Textures", string label = "Right wall" ]],
+    string backTex   = ""   [[ string widget = "filename", string page = "Textures", string label = "Back wall" ]],
+    string ceilTex   = ""   [[ string widget = "filename", string page = "Textures", string label = "Ceiling" ]],
+    string floorTex  = ""   [[ string widget = "filename", string page = "Textures", string label = "Floor" ]],
+    string windowTex = ""   [[ string widget = "filename", string page = "Textures", string label = "Window mask (front)" ]],
+
+    // ===== Room box (world units) =========================================
+    float roomWidth  = 3.0  [[ string page = "Room", string label = "Room width (world units)", float min = 0.1, float max = 50.0 ]],
+    float roomHeight = 2.8  [[ string page = "Room", string label = "Floor height (world units)", float min = 0.1, float max = 20.0 ]],
+    float roomDepth  = 6.0  [[ string page = "Room", string label = "Room depth (world units)", float min = 0.1, float max = 100.0 ]],
+
+    // ===== Tiling ==========================================================
+    int   repeatU       = 1 [[ string page = "Tiling", string label = "Rooms across (U tiling)" ]],
+    int   repeatV       = 1 [[ string page = "Tiling", string label = "Floors (V tiling)" ]],
+    int   windowRepeatU = 1 [[ string page = "Tiling", string label = "Window tiles per room (U)" ]],
+    int   windowRepeatV = 1 [[ string page = "Tiling", string label = "Window tiles per room (V)" ]],
+
+    // ===== Sprite (midground) =============================================
+    string spriteSheet = "" [[ string widget = "filename", string page = "Sprite", string label = "Sprite sheet (RGBA)", string help = "Single grid of sprite tiles; RGB colour, alpha cuts out the sprite" ]],
+    int    spriteGrid  = 1  [[ string page = "Sprite", string label = "Grid size (N x N)", string help = "Tiles per side (1 = single image, 2 = 2x2, 3 = 3x3, ...)", int min = 1, int max = 16 ]],
+    int    spriteMode  = 0  [[ string widget = "mapper", string page = "Sprite", string label = "Mode", string options = "Random=0|Index=1", string help = "0 = Random: random tile per sprite. 1 = Index: every sprite uses the Sprite index tile", int min = 0, int max = 1 ]],
+    int    spriteIndex = 1  [[ string page = "Sprite", string label = "Sprite index", string help = "Tile in Index mode, counting from top-left (1-based)", int min = 1, int max = 256 ]],
+    float spriteCenterX = 0.0 [[ string page = "Sprite", string label = "Sprite center X", string help = "Horizontal position, fraction of room width (0 = middle)", float min = -0.5, float max = 0.5 ]],
+    float spriteCenterY = 0.0 [[ string page = "Sprite", string label = "Sprite center Y", string help = "Lift above the floor, fraction of room height (0 = standing on the floor)", float min = -0.5, float max = 0.5 ]],
+    float spriteCenterZ = 0.6 [[ string page = "Sprite", string label = "Sprite center Z (depth)", string help = "Depth (0 front, 1 back)", float min = 0.0, float max = 1.0 ]],
+    float spriteSpreadX = 0.0 [[ string page = "Sprite", string label = "Sprite spread X", string help = "Max random horizontal scatter (+/-) from the center, fraction of room width", float min = 0.0, float max = 0.5 ]],
+    float spriteSpreadY = 0.0 [[ string page = "Sprite", string label = "Sprite spread Y", string help = "Max random vertical scatter (+/-) from the center, fraction of room height", float min = 0.0, float max = 0.5 ]],
+    float spriteSpreadZ = 0.0 [[ string page = "Sprite", string label = "Sprite spread Z", string help = "Max random depth scatter (+/-) from the center, fraction of room depth", float min = 0.0, float max = 0.5 ]],
+    int   spriteCount   = 1   [[ string page = "Sprite", string label = "Sprite count", string help = "Sprites per room, each scattered within the spread around the center. Each one appears with Sprite ratio chance", int min = 1, int max = 16 ]],
+    float spriteScale   = 0.7 [[ string page = "Sprite", string label = "Sprite scale (fraction of room height)", string help = "Sprite height as a fraction of the floor height; width follows the sprite tile's own aspect, so widening the room adds space instead of stretching the sprite", float min = 0.0, float max = 1.5 ]],
+    float spriteRatio   = 1.0 [[ string page = "Sprite", string label = "Sprite ratio", string help = "Chance (0..1) that each sprite appears, so a room averages Sprite count x ratio sprites", float min = 0.0, float max = 1.0 ]],
+
+    // ===== Curtains / blinds ==============================================
+    string curtainTex = "" [[ string widget = "filename", string page = "Curtains", string label = "Curtains / blinds sheet (RGBA)", string help = "Single image or N x N grid of curtain tiles; RGB colour; alpha cuts out transparent parts (gaps between blinds etc.)" ]],
+    int    curtainGrid  = 1 [[ string page = "Curtains", string label = "Grid size (N x N)", string help = "Curtain sheet tiles per side (1 = single image, 2 = 2x2, ...)", int min = 1, int max = 16 ]],
+    int    curtainMode  = 0 [[ string widget = "mapper", string page = "Curtains", string label = "Mode", string options = "Random=0|Index=1", string help = "0 = Random: random tile per room. 1 = Index: every room uses the Curtain index tile", int min = 0, int max = 1 ]],
+    int    curtainIndex = 1 [[ string page = "Curtains", string label = "Curtain index", string help = "Tile in Index mode, counting from top-left (1-based)", int min = 1, int max = 256 ]],
+    int    curtainVertical = 0 [[ string widget = "checkBox", string page = "Curtains", string label = "Vertical (from above)", string help = "Off = horizontal (pull from left and right), On = vertical (comes down from above)" ]],
+    int    curtainRepeatU = 1 [[ string page = "Curtains", string label = "Horizontal tiling (vertical blinds)", string help = "Number of times the blinds texture tiles across the width (vertical mode only)" ]],
+    int    curtainPerTile = 1 [[ string widget = "checkBox", string page = "Curtains", string label = "Random drop per tile", string help = "Vertical mode: each horizontal tile gets its own closed amount between Closed min and max (Closed ratio still closes the whole room)" ]],
+    float  curtainMin       = 0.0 [[ string page = "Curtains", string label = "Closed min", string help = "Most-open state the blinds can be (0 = fully open)", float min = 0.0, float max = 1.0 ]],
+    float  curtainMax       = 1.0 [[ string page = "Curtains", string label = "Closed max", string help = "Most-closed state the blinds can reach (1 = fully closed)", float min = 0.0, float max = 1.0 ]],
+    float  curtainClosedRatio = 0.0 [[ string page = "Curtains", string label = "Closed ratio", string help = "Chance (0..1) a room is randomly fully closed (0 = disabled)", float min = 0.0, float max = 1.0 ]],
+    float  curtainBlend     = 0.0 [[ string page = "Curtains", string label = "Translucency blend", string help = "Light bleed-through: adds the room variation to the blinds colour", float min = 0.0, float max = 1.0 ]],
+
+    // ===== Noise (lit randomization) =======================================
+    float varyRooms     = 0.0 [[ string page = "Noise", string label = "Variation amount", string help = "0 = no variation, 1 = full ramp variation", float min = 0.0, float max = 1.0 ]],
+    string variationRampTex = "" [[ string widget = "filename", string page = "Noise", string label = "Variation ramp texture", string help = "1D horizontal gradient (baked ramp); sampled at a random x per room" ]],
+    float litRatio         = 1.0 [[ string page = "Noise", string label = "Lit ratio", string help = "Chance (0..1) a room is lit; lower = more dark rooms", float min = 0.0, float max = 1.0 ]],
+    float litNoiseThreshold = 0.0 [[ string page = "Noise", string label = "Lit noise threshold", string help = "Rooms below this noise value are unlit (0 = disabled)", float min = 0.0, float max = 1.0 ]],
+    float litNoiseScaleX   = 1.0 [[ string page = "Noise", string label = "Lit noise scale X", string help = "Noise frequency along the room's horizontal axis", float min = 0.0, float max = 10.0 ]],
+    float litNoiseScaleY   = 1.0 [[ string page = "Noise", string label = "Lit noise scale Y", string help = "Noise frequency along the room's vertical axis", float min = 0.0, float max = 10.0 ]],
+    float litNoiseScaleZ   = 1.0 [[ string page = "Noise", string label = "Lit noise scale Z", string help = "Noise frequency along the room's depth axis", float min = 0.0, float max = 10.0 ]],
+    int diagLitNoise = 0 [[ string widget = "checkBox", string page = "Noise", string label = "Show Noise Only", string help = "Output the per-room lit noise (pre-threshold) as greyscale to Color, bypassing all other shading" ]],
+    int diagCurtainNoise = 0 [[ string widget = "checkBox", string page = "Noise", string label = "Show Curtain Noise Only", string help = "Output the per-room curtain openness roll as greyscale to Color, bypassing all other shading" ]],
+
+    // ===== Emission (intensity output) =====================================
+    float emissionScale = 1.0 [[ string page = "Emission", string label = "Emission scale", string help = "Multiplier for the room intensity (brightness) output", float min = 0.0, float max = 100.0 ]],
+
+    output color outColor = 0.0 [[ string label = "Color" ]],
+    output float outAlpha = 1.0 [[ string label = "Alpha" ]],
+    output float outIntensity = 0.0 [[ string label = "Room intensity" ]]
+
+)
+{
+    // ---------- 1. Face frame (world or object space) ---------------------
+    string spc = useObjectSpace ? "object" : "world";
+    vector Nw = normalize(transform(spc, N));
+    vector up = vector(0.0, 1.0, 0.0);
+
+    // Horizontal tangent: perpendicular to up and the face normal.
+    vector T = cross(up, Nw);
+    float tlen = length(T);
+    if (tlen < 1e-4) {
+        // Face normal is (nearly) parallel to up -> floor/ceiling face.
+        // Fall back to a stable horizontal tangent.
+        T = cross(Nw, vector(1.0, 0.0, 0.0));
+        if (length(T) < 1e-4)
+            T = vector(0.0, 0.0, 1.0);
+        T = normalize(T);
+    } else {
+        T /= tlen;
+    }
+
+    // Vertical tangent (up in the face plane).
+    vector B = normalize(cross(Nw, T));
+    if (dot(B, up) < 0.0)
+        B = -B;
+
+    // Depth axis, into the room.
+    vector Z = -Nw;
+
+    // Position and view direction in the chosen space.
+    vector Pw = transform(spc, P);
+    vector Iw = transform(spc, I);
+    // Renderers differ on whether I points from the camera toward the surface
+    // or from the surface toward the camera. The ray we trace continues INTO
+    // the room, i.e. opposite the face normal (Nw points toward the viewer).
+    // Flip I if it currently points outward so Iw always points into the room;
+    // otherwise the floor/ceiling (and left/right) axes come out inverted.
+    // (On backfaces this mirrors the parallax; facades are viewed front-on.)
+    // No normalize needed: the box intersection is invariant to |Iw|.
+    if (dot(Iw, Nw) > 0.0)
+        Iw = -Iw;
+
+    // ---------- 2. Room-local coordinates ---------------------------------
+    float invW = 1.0 / max(roomWidth,  1e-4);
+    float invH = 1.0 / max(roomHeight, 1e-4);
+    float invD = 1.0 / max(roomDepth,  1e-4);
+
+    float roomX = dot(Pw, T) * invW * repeatU;
+    float roomY = dot(Pw, B) * invH * repeatV;
+    float floorX = floor(roomX);
+    float floorY = floor(roomY);
+
+    // Within-room position on the front plane [0,1).
+    float x0 = roomX - floorX;
+    float y0 = roomY - floorY;
+
+    // View direction expressed in room-local units.
+    float dx = dot(Iw, T) * invW * repeatU;
+    float dy = dot(Iw, B) * invH * repeatV;
+    float dz = dot(Iw, Z) * invD;
+    if (dz < 1e-4) dz = 1e-4;   // avoid grazing/backface blow-up
+
+    // ---------- 3. Per-room lit state and variation -----------------------
+    // Computed before any wall sampling so unlit rooms can skip all interior
+    // texture lookups. Hash rolls use offset room coordinates so variation,
+    // lit and sprite chances are mutually uncorrelated.
+    float lit = 1.0;
+
+    // Per-room lit noise (perlin), sampled once per room on the integer grid
+    // so adjacent rooms stay correlated -> natural clusters. Always computed
+    // so the diagnostic mode can show it even when the threshold is disabled.
+    float floorZ = floor(dot(Pw, Z) * invD);
+    // Sample at the room centre (+0.5) so integer-scale frequencies don't land
+    // on the noise lattice (perlin is always 0 there), then normalize
+    // [-1,1] -> [0,1] to match the threshold range.
+    float litNoise = noise("perlin", point((floorX + 0.5) * litNoiseScaleX,
+                                           (floorY + 0.5) * litNoiseScaleY,
+                                           (floorZ + 0.5) * litNoiseScaleZ)) * 0.5 + 0.5;
+
+    // Curtain openness roll: uniform per-room hash in [0,1], so openness is
+    // spread evenly across the whole Closed min..max range. (Perlin clusters
+    // around 0.5 and barely varied.) Always computed so its diagnostic can
+    // show it even when curtains are disabled.
+    float curtainNoise = noise("hash", floorX + 107.0, floorY + 109.0);
+
+    if (diagLitNoise) {
+        // Diagnostic: dump the normalized pre-threshold noise straight to
+        // Color and skip all remaining shading.
+        outColor = color(litNoise);
+        outAlpha = 1.0;
+        outIntensity = 0.0;
+        return;
+    }
+
+    if (diagCurtainNoise) {
+        // Diagnostic: dump the curtain openness noise to Color and skip all
+        // remaining shading.
+        outColor = color(curtainNoise);
+        outAlpha = 1.0;
+        outIntensity = 0.0;
+        return;
+    }
+
+    if (litRatio < 1.0) {
+        float litRoll = noise("hash", floorX + 17.0, floorY + 31.0);
+        if (litRoll >= litRatio)
+            lit = 0.0;
+    }
+    if (lit > 0.0 && litNoiseThreshold > 0.0) {
+        if (litNoise <= litNoiseThreshold)
+            lit = 0.0;
+    }
+
+    // Per-room colour variation: sample a 1D ramp texture at a random x per
+    // room. The multiplier is applied to both the room walls and the sprite
+    // so everything in a room shifts together.
+    color variation = color(1.0);
+    if (lit > 0.0 && varyRooms > 0.0 && variationRampTex != "") {
+        float rnd = noise("hash", floorX, floorY);
+        color varCol = texture(variationRampTex, rnd, 0.5);
+        variation = mix(color(1.0), varCol, varyRooms);
+    }
+
+    color result = color(0.0);
+    float roomLum = 0.0;
+    float curtainCover = 0.0;
+
+    if (lit > 0.0) {
+        // ---------- 4. Intersect the unit room box ------------------------
+        // Box: x in [0,1], y in [0,1], z in [0,1] with z = 0 at the window
+        // plane and z = 1 at the back wall.
+        float tHit = 1e20;
+        int which = 0;   // 1=back, 2=left, 3=right, 4=floor, 5=ceiling
+
+        if (enableBack) {
+            float t = 1.0 / dz;
+            if (t < tHit) { tHit = t; which = 1; }
+        }
+        if (enableLeft && dx < 0.0) {
+            float t = -x0 / dx;
+            if (t < tHit) { tHit = t; which = 2; }
+        }
+        if (enableRight && dx > 0.0) {
+            float t = (1.0 - x0) / dx;
+            if (t < tHit) { tHit = t; which = 3; }
+        }
+        if (enableFloor && dy < 0.0) {
+            float t = -y0 / dy;
+            if (t < tHit) { tHit = t; which = 4; }
+        }
+        if (enableCeiling && dy > 0.0) {
+            float t = (1.0 - y0) / dy;
+            if (t < tHit) { tHit = t; which = 5; }
+        }
+
+        // Hit position in room-local space.
+        float hx = x0 + dx * tHit;
+        float hy = y0 + dy * tHit;
+        float hz = dz * tHit;
+
+        // ---------- 5. Sample the hit wall --------------------------------
+        color roomCol;
+        if (which == 1) {         // back wall
+            roomCol = ps_tex_color(backTex, hx, ps_v(hy, flipV));
+        } else if (which == 2) {  // left wall (U = depth)
+            roomCol = ps_tex_color(leftTex, hz, ps_v(hy, flipV));
+        } else if (which == 3) {  // right wall (mirrored so it reads correctly)
+            roomCol = ps_tex_color(rightTex, 1.0 - hz, ps_v(hy, flipV));
+        } else if (which == 4) {  // floor
+            roomCol = ps_tex_color(floorTex, hx, ps_v(hz, flipV));
+        } else if (which == 5) {  // ceiling
+            roomCol = ps_tex_color(ceilTex, hx, ps_v(hz, flipV));
+        } else {
+            roomCol = color(0.05);
+        }
+
+        result = roomCol * variation;
+
+        // ---------- 6. Midground sprites ----------------------------------
+        // Up to spriteCount cards per room, each scattered around the sprite
+        // center within +/- spread and present with spriteRatio chance. All
+        // per-sprite rolls hash (room, sprite index, seed) so they are stable
+        // per room and uncorrelated with each other and with the room rolls.
+        if (enableSprite && spriteSheet != "") {
+            int grid = max(spriteGrid, 1);
+            int numTiles = grid * grid;
+            float invN = 1.0 / (float)grid;
+
+            // Card height is spriteScale of the room height; its width is
+            // derived from the tile's pixel aspect and the room's world-space
+            // aspect, so a wider room just gives the sprite more space
+            // instead of stretching it.
+            float tileAspect = 1.0;
+            int res[2];
+            if (gettextureinfo(spriteSheet, "resolution", res) && res[1] > 0)
+                tileAspect = (float)res[0] / (float)res[1];
+            float cellW = roomWidth  / max((float)repeatU, 1e-4);
+            float cellH = roomHeight / max((float)repeatV, 1e-4);
+            float sH = max(spriteScale, 1e-4);
+            float sW = max(sH * tileAspect * cellH / max(cellW, 1e-4), 1e-4);
+
+            // Gather every visible sprite hit for this pixel, then composite
+            // back to front so overlapping sprites occlude correctly.
+            int count = clamp(spriteCount, 1, 16);
+            float hitT[16];
+            color hitC[16];
+            float hitA[16];
+            int nHits = 0;
+
+            for (int i = 0; i < count; ++i) {
+                float fi = (float)i;
+                if (ps_hash(point(floorX + 59.0, floorY + 73.0, fi)) >= spriteRatio)
+                    continue;
+
+                // Random signed scatter in [-1,1] per axis.
+                float rx = ps_hash(point(floorX + 11.0, floorY + 13.0, fi)) * 2.0 - 1.0;
+                float ry = ps_hash(point(floorX + 23.0, floorY + 29.0, fi)) * 2.0 - 1.0;
+                float rz = ps_hash(point(floorX + 37.0, floorY + 41.0, fi)) * 2.0 - 1.0;
+                float cx = 0.5 + spriteCenterX + rx * spriteSpreadX;
+                float cy = spriteCenterY + ry * spriteSpreadY;
+                float cz = clamp(spriteCenterZ + rz * spriteSpreadZ, 0.001, 0.999);
+
+                float tS = cz / dz;
+                if (tS >= tHit)
+                    continue;   // behind the wall the ray already hit
+
+                float sx = x0 + dx * tS;
+                float sy = y0 + dy * tS;
+                float su = (sx - (cx - 0.5 * sW)) / sW;
+                float sv = (sy - cy) / sH;
+                if (su < 0.0 || su > 1.0 || sv < 0.0 || sv > 1.0)
+                    continue;
+
+                // Tile selection: Index = fixed tile (1-based, top-left),
+                // Random = per sprite.
+                int sIdx;
+                if (spriteMode == 1) {
+                    sIdx = clamp(spriteIndex - 1, 0, numTiles - 1);
+                } else {
+                    float sel = ps_hash(point(floorX + 83.0, floorY + 97.0, fi));
+                    sIdx = (int)floor(clamp(sel, 0.0, 0.999) * (float)numTiles);
+                }
+                // Tiles count from the top-left; texture V grows upward, so
+                // row 0 (top) maps to the highest V band.
+                float u0 = (float)(sIdx % grid) * invN;
+                float v0 = (float)(grid - 1 - sIdx / grid) * invN;
+
+                float spA;
+                color spC = ps_tex_color_alpha(spriteSheet, u0 + su * invN,
+                                               v0 + ps_v(sv, flipV) * invN, spA);
+                if (spA > 0.0) {
+                    hitT[nHits] = tS;
+                    hitC[nHits] = spC;
+                    hitA[nHits] = spA;
+                    ++nHits;
+                }
+            }
+
+            // Back-to-front: repeatedly take the farthest remaining hit.
+            for (int k = 0; k < nHits; ++k) {
+                int far = k;
+                for (int j = k + 1; j < nHits; ++j)
+                    if (hitT[j] > hitT[far]) far = j;
+                if (far != k) {
+                    float tt = hitT[k]; hitT[k] = hitT[far]; hitT[far] = tt;
+                    color tc = hitC[k]; hitC[k] = hitC[far]; hitC[far] = tc;
+                    float ta = hitA[k]; hitA[k] = hitA[far]; hitA[far] = ta;
+                }
+                result = mix(result, hitC[k] * variation, hitA[k]);
+            }
+        }
+
+        // Room luminance for the intensity output (walls + sprites), captured
+        // before the curtains and window mask block it.
+        roomLum = luminance(result);
+
+        // ---------- 6b. Curtains / blinds --------------------------------
+        if (enableCurtains && curtainTex != "") {
+            // Per-room openness: uniformly random between Closed min and max.
+            float closed = mix(curtainMin, curtainMax, curtainNoise);
+
+            // Random full-close roll (like litRatio): rooms whose hash falls
+            // below the closed ratio are forced fully closed.
+            if (curtainClosedRatio > 0.0) {
+                float closedRoll = noise("hash", floorX + 101.0, floorY + 103.0);
+                if (closedRoll < curtainClosedRatio)
+                    closed = 1.0;
+            }
+
+            // Curtain sheet tile for this room (same N x N layout and
+            // top-left 1-based indexing as the sprite sheet).
+            int cGrid = max(curtainGrid, 1);
+            int cTiles = cGrid * cGrid;
+            int cIdx;
+            if (curtainMode == 1) {
+                cIdx = clamp(curtainIndex - 1, 0, cTiles - 1);
+            } else {
+                float cSel = noise("hash", floorX + 113.0, floorY + 127.0);
+                cIdx = (int)floor(clamp(cSel, 0.0, 0.999) * (float)cTiles);
+            }
+            float cInvN = 1.0 / (float)cGrid;
+            float cu0 = (float)(cIdx % cGrid) * cInvN;
+            float cv0 = (float)(cGrid - 1 - cIdx / cGrid) * cInvN;
+
+            float cover = 0.0;
+            color curtainCol = color(0.0);
+            float curtainA = 0.0;
+            if (curtainVertical) {
+                // Blind comes down from above: covers the top portion.
+                // With per-tile variation each horizontal tile (blind panel)
+                // rolls its own drop between Closed min and max, unless the
+                // room was forced fully closed by the closed ratio.
+                float tileX = x0 * curtainRepeatU;
+                float tileIdx = floor(tileX);
+                float drop = closed;
+                if (curtainPerTile && curtainRepeatU > 1 && closed < 1.0) {
+                    float tileRoll = ps_hash(point(floorX + 107.0, floorY + 109.0, tileIdx));
+                    drop = mix(curtainMin, curtainMax, tileRoll);
+                }
+                if (y0 >= 1.0 - drop) {
+                    cover = 1.0;
+                    float cU = tileX - tileIdx;
+                    curtainCol = ps_tex_color_alpha(curtainTex, cu0 + cU * cInvN, cv0 + ps_v(y0, flipV) * cInvN, curtainA);
+                }
+            } else {
+                // Curtains pull across from left and right.
+                float half = 0.5 * closed;
+                if (x0 <= half) {
+                    cover = 1.0;
+                    curtainCol = ps_tex_color_alpha(curtainTex, cu0 + 2.0 * x0 * cInvN, cv0 + ps_v(y0, flipV) * cInvN, curtainA);
+                } else if (x0 >= 1.0 - half) {
+                    cover = 1.0;
+                    curtainCol = ps_tex_color_alpha(curtainTex, cu0 + (2.0 * x0 - 1.0) * cInvN, cv0 + ps_v(y0, flipV) * cInvN, curtainA);
+                }
+            }
+
+            // The texture's alpha cuts out transparent parts of the curtain
+            // (e.g. gaps between slats), modulating the closed coverage.
+            cover *= curtainA;
+            curtainCover = cover;   // effective curtain occlusion for intensity
+
+            if (cover > 0.0) {
+                // Tint like the room, then simulate translucency by adding
+                // the room variation (light bleed) scaled by the blend value.
+                curtainCol = curtainCol * variation + variation * curtainBlend;
+                result = mix(result, curtainCol, cover);
+            }
+        }
+    }
+
+    // ---------- 7. Front window mask --------------------------------------
+    float wA = 0.0;
+    if (enableWindow && windowTex != "") {
+        float wU = (x0 * windowRepeatU) - floor(x0 * windowRepeatU);
+        float wV = (y0 * windowRepeatV) - floor(y0 * windowRepeatV);
+
+        color wC = ps_tex_color_alpha(windowTex, wU, ps_v(wV, flipV), wA);
+        // No window mask = fully transparent front = see the room directly.
+        result = mix(result, wC, wA);
+    }
+
+    outColor = result;
+    // Opaque facade minus the window mask: the alpha channel cuts holes where
+    // the windows are, so the windows can be separated (inverted) in comp.
+    outAlpha = 1.0 - wA;
+
+    // Room "brightness" (emissive intensity) seen through the window mask and
+    // the curtains. The window blocks (1 - wA). The curtain occludes by
+    // curtainCover but lets curtainBlend of the room light bleed through
+    // (translucency), so the surviving light is
+    // (1 - curtainCover * (1 - curtainBlend)).
+    outIntensity = roomLum
+                 * (1.0 - wA)
+                 * (1.0 - curtainCover * (1.0 - curtainBlend))
+                 * emissionScale;
+}
