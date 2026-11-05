@@ -1,0 +1,112 @@
+// Attribute Wrangle "solve" inside HDA. Run Over: Detail (only once)
+// Reads parms from HDA via ../
+
+function vector bez(vector a; vector b; vector c; vector d; float t) {
+    float u = 1.0 - t;
+    return u*u*u*a + 3*u*u*t*b + 3*u*t*t*c + t*t*t*d;
+}
+
+string grp = chs("../edges");
+if (strip(grp) == "") return;   // empty group = ALL edges in VEX
+int ep[] = expandedgegroup(0, grp);
+int ne = len(ep) / 2;
+int minE = chi("../min_edges");
+if (ne == 0) return;
+if (ne < minE) { warning("Need >= %d edges, got %d", minE, ne); return; }
+
+// adjacency (stored as ptnum+1 so 0 = empty)
+int np = npoints(0);
+int deg[], na[], nb[];
+resize(deg, np); resize(na, np); resize(nb, np);
+for (int i = 0; i < ne; i++) {
+    int a = ep[2*i], b = ep[2*i+1];
+    if (a == b || na[a] == b+1 || nb[a] == b+1) continue; // dupes
+    if (deg[a] == 0) na[a] = b+1; else nb[a] = b+1; deg[a]++;
+    if (deg[b] == 0) na[b] = a+1; else nb[b] = a+1; deg[b]++;
+}
+
+int ends[];
+int nUnique = 0;
+foreach (int p; ep) {
+    if (deg[p] > 2) { error("Selection branches at point %d", p); return; }
+    if (deg[p] == 1 && find(ends, p) < 0) append(ends, p);
+}
+if (len(ends) != 2) { error("Edges must form ONE open chain (found %d ends)", len(ends)); return; }
+
+// walk chain from lower ptnum (stable handle orientation)
+int s = min(ends[0], ends[1]);
+int chain[] = array(s);
+int prev = -1, cur = s;
+while (len(chain) <= ne + 1) {
+    int nxt = na[cur] - 1;
+    if (nxt == prev) nxt = nb[cur] - 1;
+    if (nxt < 0) break;
+    append(chain, nxt);
+    prev = cur; cur = nxt;
+}
+int m = len(chain);
+if (m != ne + 1) { error("Selection is disconnected"); return; }
+
+// original arc-length fractions
+float cum[]; resize(cum, m);
+for (int i = 1; i < m; i++) {
+    vector pa = point(0, "P", chain[i-1]);
+    vector pb = point(0, "P", chain[i]);
+    cum[i] = cum[i-1] + distance(pa, pb);
+}
+float total = max(cum[m-1], 1e-9);
+
+// original endpoints + default handles at 1/3, 2/3
+vector O0 = point(0, "P", chain[0]);
+vector O3 = point(0, "P", chain[m-1]);
+vector D1 = lerp(O0, O3, 1.0/3.0);
+vector D2 = lerp(O0, O3, 2.0/3.0);
+
+vector P0 = O0, P1 = D1, P2 = D2, P3 = O3;
+if (chi("../custom_handles")) {
+    P1 = chv("../handle1");
+    P2 = chv("../handle2");
+    if (!chi("../lock_ends")) {
+        P0 = chv("../start_pos");
+        P3 = chv("../end_pos");
+    }
+}
+
+// for viewer state + init (deleted downstream)
+setdetailattrib(0, "bz_o0", O0);
+setdetailattrib(0, "bz_o3", O3);
+setdetailattrib(0, "bz_d1", D1);
+setdetailattrib(0, "bz_d2", D2);
+setdetailattrib(0, "bz_c0", P0);
+setdetailattrib(0, "bz_c1", P1);
+setdetailattrib(0, "bz_c2", P2);
+setdetailattrib(0, "bz_c3", P3);
+
+// arc-length LUT of bezier
+int S = 512;
+float L[]; resize(L, S+1);
+vector pp = P0;
+for (int k = 1; k <= S; k++) {
+    vector q = bez(P0, P1, P2, P3, float(k)/S);
+    L[k] = L[k-1] + distance(pp, q);
+    pp = q;
+}
+float BL = L[S];
+
+int uni = chi("../uniform");
+float blend = chf("../blend");
+for (int i = 1; i < m-1; i++) {
+    float f = uni ? float(i)/(m-1) : cum[i]/total;
+    float target = f * BL;
+    int lo = 0, hi = S;
+    while (hi - lo > 1) { int mid = (lo+hi)/2; if (L[mid] < target) lo = mid; else hi = mid; }
+    float seg = L[hi] - L[lo];
+    float t = (lo + (seg > 0 ? (target - L[lo]) / seg : 0)) / S;
+    vector old = point(0, "P", chain[i]);
+    setpointattrib(0, "P", chain[i], lerp(old, bez(P0, P1, P2, P3, t), blend));
+}
+
+// move endpoints too
+float bl = chf("../blend");
+setpointattrib(0, "P", chain[0],   lerp(O0, P0, bl));
+setpointattrib(0, "P", chain[m-1], lerp(O3, P3, bl));
